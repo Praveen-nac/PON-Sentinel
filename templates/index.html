@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PON-Sentinel — Explainable Eavesdropping Detection</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<style>
+  :root {
+    --navy: #1f3864; --accent: #2e74b5; --danger: #c0392b;
+    --warn: #d68910; --bg: #f4f6f8; --card: #ffffff; --text: #2b2b2b;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; background: var(--bg); margin: 0; color: var(--text); }
+  header { background: var(--navy); color: white; padding: 20px 32px; }
+  header h1 { margin: 0; font-size: 22px; }
+  header p { margin: 4px 0 0; font-size: 13px; opacity: 0.85; }
+  .container { padding: 24px 32px; display: grid; grid-template-columns: 340px 1fr; gap: 20px; }
+  .card { background: var(--card); border-radius: 8px; padding: 16px 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 20px; }
+  .card h2 { margin: 0 0 12px; font-size: 15px; color: var(--navy); border-bottom: 1px solid #e0e0e0; padding-bottom: 8px; }
+  .summary-row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; border-bottom: 1px dashed #eee; }
+  .summary-row span.pct { font-weight: 600; }
+  .pct-high { color: var(--danger); }
+  .pct-mid { color: var(--warn); }
+  .pct-low { color: #2e8b57; }
+  #onu-list { max-height: 480px; overflow-y: auto; }
+  .onu-item { padding: 8px 10px; border-radius: 6px; cursor: pointer; font-size: 13px; display: flex; justify-content: space-between; margin-bottom: 4px; }
+  .onu-item:hover { background: #eef2f7; }
+  .onu-item.active { background: var(--accent); color: white; }
+  .badge { font-size: 11px; padding: 2px 6px; border-radius: 10px; background: #eee; color: #555; }
+  .badge.eavesdrop_tap { background: #fdecea; color: var(--danger); }
+  .badge.macrobend { background: #fef5e6; color: var(--warn); }
+  .badge.brute_force { background: #eae6fd; color: #6c3fc5; }
+  .badge.normal { background: #eafaf1; color: #2e8b57; }
+  canvas { max-height: 320px; }
+  .reason-item { background: #f9fafb; border-left: 3px solid var(--accent); padding: 8px 12px; margin-bottom: 8px; border-radius: 4px; font-size: 13px; }
+  .reason-item .t { color: var(--navy); font-weight: 600; }
+  .reason-feat { display: inline-block; background: #fff; border: 1px solid #ddd; border-radius: 4px; padding: 2px 6px; margin: 2px 4px 0 0; font-size: 12px; font-family: monospace; }
+  #placeholder { color: #999; font-size: 13px; padding: 40px; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🛰️ PON-Sentinel</h1>
+  <p>ML-based eavesdropping &amp; fiber-tap detection for GPON/EPON access networks — with explainable flags</p>
+</header>
+
+<div class="container">
+  <div>
+    <div class="card">
+      <h2>Detection Summary (by true event type)</h2>
+      <div id="summary"></div>
+    </div>
+    <div class="card">
+      <h2>ONUs — click to inspect</h2>
+      <div id="onu-list"></div>
+    </div>
+  </div>
+
+  <div>
+    <div class="card">
+      <h2 id="chart-title">Power Telemetry &amp; Anomaly Score</h2>
+      <canvas id="powerChart"></canvas>
+    </div>
+    <div class="card">
+      <h2>Why was this flagged? (SHAP explainability)</h2>
+      <div id="explain-panel"><div id="placeholder">Select an ONU with flagged points to see explanations.</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+let chart = null;
+
+function pctClass(p) {
+  if (p >= 70) return 'pct-high';
+  if (p >= 30) return 'pct-mid';
+  return 'pct-low';
+}
+
+async function loadSummary() {
+  const res = await fetch('/api/summary');
+  const data = await res.json();
+  const el = document.getElementById('summary');
+  el.innerHTML = data.map(d => `
+    <div class="summary-row">
+      <span>${d.event_type} <small style="color:#999">(n=${d.count})</small></span>
+      <span class="pct ${pctClass(d.flagged_pct)}">${d.flagged_pct}% flagged</span>
+    </div>`).join('');
+}
+
+async function loadOnuList() {
+  const res = await fetch('/api/onus');
+  const data = await res.json();
+  const el = document.getElementById('onu-list');
+  el.innerHTML = data.map(o => `
+    <div class="onu-item" data-onu="${o.onu_id}" onclick="selectOnu(${o.onu_id})">
+      <span>ONU #${o.onu_id} <span class="badge ${o.true_event}">${o.true_event}</span></span>
+      <span>${o.anomaly_points} flagged</span>
+    </div>`).join('');
+}
+
+async function selectOnu(id) {
+  document.querySelectorAll('.onu-item').forEach(el => el.classList.remove('active'));
+  document.querySelector(`.onu-item[data-onu="${id}"]`).classList.add('active');
+
+  const res = await fetch(`/api/onu/${id}`);
+  const d = await res.json();
+  document.getElementById('chart-title').textContent = `ONU #${id} — Power Telemetry & Anomaly Score`;
+
+  const ctx = document.getElementById('powerChart');
+  if (chart) chart.destroy();
+  chart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: d.t,
+      datasets: [
+        {
+          label: 'Power (dBm)', data: d.power_dbm, borderColor: '#2e74b5',
+          borderWidth: 1.5, pointRadius: 0, yAxisID: 'y', tension: 0.1
+        },
+        {
+          label: 'Anomaly points', data: d.power_dbm.map((v, i) => d.is_anomaly[i] ? v : null),
+          borderColor: '#c0392b', backgroundColor: '#c0392b', pointRadius: 3,
+          showLine: false, yAxisID: 'y'
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      scales: { y: { title: { display: true, text: 'dBm' } }, x: { title: { display: true, text: 'timestep' } } },
+      plugins: { legend: { position: 'bottom' } }
+    }
+  });
+
+  loadExplain(id);
+}
+
+async function loadExplain(id) {
+  const res = await fetch(`/api/explain/${id}`);
+  const d = await res.json();
+  const el = document.getElementById('explain-panel');
+  if (!d.reasons.length) {
+    el.innerHTML = '<div id="placeholder">No flagged points for this ONU.</div>';
+    return;
+  }
+  el.innerHTML = d.reasons.map(r => `
+    <div class="reason-item">
+      <span class="t">t=${r.t}</span> — anomaly score ${r.anomaly_score}<br/>
+      Top contributing features:
+      ${r.top_reasons.map(f => `<span class="reason-feat">${f[0]}: ${f[1]}</span>`).join('')}
+    </div>`).join('');
+}
+
+loadSummary();
+loadOnuList();
+</script>
+</body>
+</html>

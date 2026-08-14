@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+*.log
+explain_out.json
+
+# Regenerable — run simulate.py -> features.py -> detector.py to recreate
+data/*.csv
+models/*.joblib
+!data/.gitkeep
+!models/.gitkeep
